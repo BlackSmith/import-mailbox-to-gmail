@@ -23,7 +23,9 @@ import io
 import json
 import logging
 import mailbox
+import email
 import os
+import re
 
 from apiclient import discovery
 import httplib2
@@ -73,16 +75,23 @@ parser.add_argument(
     "Replace 'Content-Type: text/quoted-printable' with text/plain (default: "
     "don't change it)")
 parser.add_argument(
+    '--maildir',
+    dest='maildir',
+    required=False,
+    action='store_true',
+    help=
+    "Use maildir instead mbox. Parameter dir is the place of maildirs ")
+parser.add_argument(
     '--num_retries',
     default=10,
     type=int,
     help=
     'Maximum number of exponential backoff retries for failures (default: 10)')
-parser.set_defaults(fix_msgid=True, replace_quoted_printable=False)
+parser.set_defaults(fix_msgid=True, replace_quoted_printable=False, maildir=False)
 args = parser.parse_args()
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.insert',
-          'https://www.googleapis.com/auth/gmail.labels']
+          'https://www.googleapis.com/auth/gmail.labels',]
 APPLICATION_NAME = 'Google Apps Gmail mbox importer'
 
 
@@ -113,18 +122,79 @@ def get_label_id_from_name(service, username, labels, labelname):
   try:
     label_object = {
         'messageListVisibility': 'show',
-        'name': labelname,
+        'name': "%s" % labelname,
         'labelListVisibility': 'labelShow'
     }
     label = service.users().labels().create(
         userId=username,
         body=label_object).execute(num_retries=args.num_retries)
     logging.info("Label '%s' created", labelname)
+    labels.append({'name': labelname, 'id': label['id']})
     return label['id']
   except:
     logging.exception("Can't create label '%s' for user %s", labelname,
                       username)
     raise
+
+
+def modified_unbase64(s):
+    s_utf7 = '+' + s.replace(',', '/') + '-'
+    return s_utf7.decode('utf-7')
+
+
+def decode(s):
+    r = []
+    decode = []
+    for c in s:
+        if c == '&' and not decode:
+            decode.append('&')
+        elif c == '-' and decode:
+            if len(decode) == 1:
+                r.append('&')
+            else:
+                r.append(modified_unbase64(''.join(decode[1:])))
+            decode = []
+        elif decode:
+            decode.append(c)
+        else:
+            r.append(c)
+    if decode:
+        r.append(modified_unbase64(''.join(decode[1:])))
+    out = ''.join(r)
+
+    if not isinstance(out, unicode):
+       out = unicode(out)
+    return out
+
+def remap(folder):
+    folder = decode(folder)
+    if folder in (u'Ko\u0161', 'Trash', 'Deleted Items'):
+        return 'TRASH'
+    elif folder in ('Koncepty', 'Drafts'):
+        return 'DRAFT'
+    elif folder in (u'Nevy\u017e\xe1dan\xe1', 'Junk'):
+        return 'SPAM'
+    elif folder in (u'Odeslan\xe1', 'Sent', 'Sent Items'):
+        return 'SENT'
+    elif folder in (u'Arch\xedv'):
+        return 'Archives'
+    elif folder is None or folder.find('INBOX') >= 0:
+        return 'INBOX'
+    else:
+        return folder.replace('.','/')
+
+def load_migration(filename):
+    ids = list()
+    if os.path.exists(filename):
+        with open(filename , 'r') as fd:
+            for line in fd.readlines():
+               ids.append(line.split('|')[1])
+    return ids
+
+def save_migration(filename, ids):
+    with open( filename, 'a+') as fd:
+        for id in ids:
+            fd.write("%s\n"% "|".join(id))
 
 
 def main():
@@ -139,8 +209,12 @@ def main():
   logging.info('Arguments:')
   for arg, value in sorted(vars(args).items()):
       logging.info('\t%s: %r', arg, value)
+  domain = os.path.basename(os.path.normpath(args.dir))
   for username in next(os.walk(args.dir))[1]:
     try:
+      mfolder = os.path.join(args.dir, username)
+      if username.find('@') < 0:
+          username = "{username}@{domain}".format(username=username, domain=domain)
       logging.info('Processing user %s', username)
       try:
         credentials = get_credentials(username)
@@ -160,73 +234,159 @@ def main():
         raise
 
       try:
-        for filename in os.listdir(os.path.join(args.dir, username)):
-          labelname, ext = os.path.splitext(filename)
-          full_filename = os.path.join(args.dir, username, filename)
-          if ext == '.mbox':
-            logging.info("Starting processing of '%s'", full_filename)
-            mbox = mailbox.mbox(full_filename)
-            label_id = get_label_id_from_name(service, username, labels,
-                                              labelname)
-            logging.info("Using label name '%s', ID '%s'", labelname, label_id)
-            for index, message in enumerate(mbox):
-              logging.info("Processing message %d in label '%s'", index,
-                           labelname)
-              try:
-                if (args.replace_quoted_printable and
-                    'Content-Type' in message and
-                    'text/quoted-printable' in message['Content-Type']):
-                  message.replace_header(
-                      'Content-Type', message['Content-Type'].replace(
-                          'text/quoted-printable', 'text/plain'))
-                  logging.info('Replaced text/quoted-printable with text/plain')
-              except (KeyboardInterrupt, SystemExit):
-                raise
-              except:
-                logging.exception(
-                    'Failed to replace text/quoted-printable with text/plain '
-                    'in Content-Type header')
-              try:
-                if args.fix_msgid and 'Message-ID' in message:
-                  msgid = message['Message-ID']
-                  if msgid[0] != '<':
-                    msgid = '<' + msgid
-                    logging.info('Added < to Message-ID: %s', msgid)
-                  if msgid[-1] != '>':
-                    msgid += '>'
-                    logging.info('Added > to Message-ID: %s', msgid)
-                  message.replace_header('Message-ID', msgid)
-              except (KeyboardInterrupt, SystemExit):
-                raise
-              except:
-                logging.exception('Failed to fix brackets in Message-ID header')
-              try:
-                metadata_object = {'labelIds': [label_id]}
-                # Use media upload to allow messages more than 5mb.
-                # See https://developers.google.com/api-client-library/python/guide/media_upload
-                # and http://google-api-python-client.googlecode.com/hg/docs/epy/apiclient.http.MediaIoBaseUpload-class.html.
-                message_data = io.BytesIO(message.as_string())
-                media = MediaIoBaseUpload(message_data,
-                                          mimetype='message/rfc822')
-                message_response = service.users().messages().import_(
-                    userId=username,
-                    fields='id',
-                    neverMarkSpam=True,
-                    processForCalendar=False,
-                    internalDateSource='dateHeader',
-                    body=metadata_object,
-                    media_body=media).execute(num_retries=args.num_retries)
-                logging.debug("Imported mbox message '%s' to Gmail ID %s",
-                              message.get_from(), message_response['id'])
-              except (KeyboardInterrupt, SystemExit):
-                raise
-              except:
-                logging.exception('Failed to import mbox message')
-            logging.info("Finished processing '%s'", full_filename)
-          else:
-            logging.info(
-                "Skipping '%s' because it doesn't have a .mbox extension",
-                full_filename)
+        if args.maildir:
+          mdir = mailbox.Maildir(mfolder, email.message_from_file)
+          mfolders = mdir.list_folders()
+          mfolders.append(None)
+          mfolders.sort()
+          print mfolders
+          for folder in mfolders:
+              if folder is not None:
+                  sdir = mdir.get_folder(folder)
+              else:
+                  sdir = mdir
+                  folder = 'INBOX'
+              label_id = get_label_id_from_name(service, username, labels, "%s" % remap(folder))
+              migration_file = os.path.join(mfolder, '%s-migration.txt' % label_id)
+              exist_ids = load_migration(migration_file)
+              new_ids = list()
+              #print label_id, remap(folder), folder
+              for index, message in sdir.iteritems():
+                  if index in exist_ids:
+                      logging.info("Skip message %s in label '%s'", index, label_id)
+                      continue
+                  logging.info("Processing message %s in label '%s'", index, label_id)
+                  try:
+                    if (args.replace_quoted_printable and
+                        'Content-Type' in message and
+                        'text/quoted-printable' in message['Content-Type']):
+                        message.replace_header(
+                          'Content-Type', message['Content-Type'].replace(
+                              'text/quoted-printable', 'text/plain'))
+                        logging.info('Replaced text/quoted-printable with text/plain')
+                  except (KeyboardInterrupt, SystemExit):
+                    raise
+                  except:
+                    logging.exception(
+                        'Failed to replace text/quoted-printable with text/plain '
+                        'in Content-Type header')
+
+                  try:
+                    if args.fix_msgid and 'Message-ID' in message:
+                      msgid = message['Message-ID']
+                      if msgid[0] != '<':
+                        msgid = '<' + msgid
+                        logging.info('Added < to Message-ID: %s', msgid)
+                      if msgid[-1] != '>':
+                        msgid += '>'
+                        logging.info('Added > to Message-ID: %s', msgid)
+                      message.replace_header('Message-ID', msgid)
+                  except (KeyboardInterrupt, SystemExit):
+                    raise
+                  except:
+                    logging.exception('Failed to fix brackets in Message-ID header')
+
+                  labelIds = [label_id]
+                  print index
+                  if re.search(r',[^,]*S[^,]*$', sdir._toc[index]) is None:
+                      labelIds.append('UNREAD')
+
+                  try:
+                    metadata_object = {'labelIds': labelIds}
+                    # Use media upload to allow messages more than 5mb.
+                    # See https://developers.google.com/api-client-library/python/guide/media_upload
+                    # and http://google-api-python-client.googlecode.com/hg/docs/epy/apiclient.http.MediaIoBaseUpload-class.html.
+                    message_data = io.BytesIO(message.as_string())
+                    media = MediaIoBaseUpload(message_data,
+                                              mimetype='message/rfc822')
+                    message_response = service.users().messages().import_(
+                        userId=username,
+                        fields='id',
+                        neverMarkSpam=False,
+                        processForCalendar=False,
+                        internalDateSource='dateHeader',
+                        body=metadata_object,
+                        media_body=media).execute(num_retries=args.num_retries)
+                    logging.debug("Imported mbox message '%s' to Gmail ID %s",
+                                  message['From'], message_response['id'])
+                    new_ids.append([message_response['id'], index])
+                  except (KeyboardInterrupt, SystemExit):
+                    raise
+                  except:
+                    logging.exception('Failed to import mbox message')
+                  finally:
+                    save_migration(migration_file, new_ids)
+                  logging.info("Finished processing '%s'", index)
+
+
+        else:
+           for filename in os.listdir(mfolder):
+              labelname, ext = os.path.splitext(filename)
+              full_filename = os.path.join(mfolder, filename)
+              if ext == '.mbox':
+                logging.info("Starting processing of '%s'", full_filename)
+                mbox = mailbox.mbox(full_filename)
+                label_id = get_label_id_from_name(service, username, labels,
+                                                  labelname)
+                logging.info("Using label name '%s', ID '%s'", labelname, label_id)
+                for index, message in enumerate(mbox):
+                  logging.info("Processing message %d in label '%s'", index,
+                               labelname)
+                  try:
+                    if (args.replace_quoted_printable and
+                        'Content-Type' in message and
+                        'text/quoted-printable' in message['Content-Type']):
+                      message.replace_header(
+                          'Content-Type', message['Content-Type'].replace(
+                              'text/quoted-printable', 'text/plain'))
+                      logging.info('Replaced text/quoted-printable with text/plain')
+                  except (KeyboardInterrupt, SystemExit):
+                    raise
+                  except:
+                    logging.exception(
+                        'Failed to replace text/quoted-printable with text/plain '
+                        'in Content-Type header')
+                  try:
+                    if args.fix_msgid and 'Message-ID' in message:
+                      msgid = message['Message-ID']
+                      if msgid[0] != '<':
+                        msgid = '<' + msgid
+                        logging.info('Added < to Message-ID: %s', msgid)
+                      if msgid[-1] != '>':
+                        msgid += '>'
+                        logging.info('Added > to Message-ID: %s', msgid)
+                      message.replace_header('Message-ID', msgid)
+                  except (KeyboardInterrupt, SystemExit):
+                    raise
+                  except:
+                    logging.exception('Failed to fix brackets in Message-ID header')
+                  try:
+                    metadata_object = {'labelIds': [label_id]}
+                    # Use media upload to allow messages more than 5mb.
+                    # See https://developers.google.com/api-client-library/python/guide/media_upload
+                    # and http://google-api-python-client.googlecode.com/hg/docs/epy/apiclient.http.MediaIoBaseUpload-class.html.
+                    message_data = io.BytesIO(message.as_string())
+                    media = MediaIoBaseUpload(message_data,
+                                              mimetype='message/rfc822')
+                    message_response = service.users().messages().import_(
+                        userId=username,
+                        fields='id',
+                        neverMarkSpam=True,
+                        processForCalendar=False,
+                        internalDateSource='dateHeader',
+                        body=metadata_object,
+                        media_body=media).execute(num_retries=args.num_retries)
+                    logging.debug("Imported mbox message '%s' to Gmail ID %s",
+                                  message.get_from(), message_response['id'])
+                  except (KeyboardInterrupt, SystemExit):
+                    raise
+                  except:
+                    logging.exception('Failed to import mbox message')
+                logging.info("Finished processing '%s'", full_filename)
+              else:
+                logging.info(
+                    "Skipping '%s' because it doesn't have a .mbox extension",
+                    full_filename)
       except (KeyboardInterrupt, SystemExit):
         raise
       except:
